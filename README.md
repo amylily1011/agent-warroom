@@ -43,19 +43,28 @@ python3 -m venv .venv
 
 A `deploy-agent` (AI coding agent) pushed a config update across:
 
-- `vm-web-01` — failed reload (invalid `http2_max_concurrent_streams` directive)
-- `vm-web-02` — clean reload
-- `vm-web-03` — clean reload
+- `vm-web-01` — failed reload (invalid `http2_max_concurrent_streams` directive on `/etc/nginx/conf.d/perf.conf:23`)
+- `vm-web-02` — clean reload (config not yet delivered)
+- `vm-web-03` — clean reload (config not yet delivered)
 
 The war room agents:
 
-1. Decider opens the room with the alert
-2. Optimist proposes the cheapest action (restart)
-3. Paranoid pulls the journal and the config diff
-4. They identify the AI-authored bad directive on line 23
-5. Decider commits to a revert
-6. Decider writes a three-line post-mortem closing with:
-   > *"Filed under: AI-authored change, needs review gate."*
+1. **Decider** opens the room with the alert and hands to Optimist.
+2. **Optimist** proposes the cheapest fix — a `systemctl reload nginx` retry — which still fails.
+3. **Paranoid** pulls evidence in one batch on `vm-web-01`: journal, `nginx -t`, config diff, commit history, and crucially `agent-log deploy-agent` — *deploy-agent's own reasoning trace*. The trace shows:
+   ```
+   DECIDE     emit `http2_max_concurrent_streams 999999;` by analogy with
+              `http2_max_field_size`, `http2_max_header_size`
+              (confidence: 0.71 — no exact directive match found)
+   VALIDATE   skipped (no `nginx -t` gate configured for deploy-agent tasks)
+   ```
+   That `VALIDATE skipped` line is the smoking gun: the AI agent self-reported skipping its own validation step.
+4. **Decider** authorizes `config-revert` and `systemctl reload nginx`. Each is a mutating action, so each pauses for human approval — a Slack-style card with **Approve / Different action / Hold (page on-call)** buttons.
+5. **Paranoid** verifies with `nginx -t` post-revert.
+6. **Decider** writes a structured post-mortem (Summary / Impact / Timeline / Root Cause / Action Items / Appendix) that quotes the `VALIDATE skipped` line verbatim in Root Cause. The action items always include the war room's signature:
+   > *"AI-authored change — requires pre-deploy validation gate."*
+
+Throughout, the sidebar **Fleet status** panel updates: capacity drops to `2 / 3`, "AI commits unvalidated" rises to `1`, "Last fleet-wide nginx -t pass" goes stale — then all three recover after the revert. A human watching that dashboard would have flagged the bad push at `13:49 UTC`, 14 minutes before the alert fired.
 
 ## Tech stack
 

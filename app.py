@@ -6,7 +6,11 @@ Run with:
 Auth: uses Claude Code session, no API key needed.
 """
 
+import queue
 import re
+import shlex
+import threading
+import time
 
 import anyio
 import streamlit as st
@@ -74,6 +78,43 @@ def call_agent(agent_key: str, transcript: str) -> str:
     return anyio.run(call_agent_async, agent_key, transcript)
 
 
+def stream_agent_text(agent_key: str, transcript: str):
+    """Sync generator: yields text chunks as the SDK produces them.
+
+    Bridges the async `query()` iterator into a sync generator via a
+    background thread + queue, so Streamlit (which is sync) can consume
+    tokens as they arrive. If the SDK yields one big chunk per turn,
+    you'll get one yield at the end — the architecture still works,
+    just doesn't *feel* streamed for that case.
+    """
+    q: queue.Queue = queue.Queue()
+    SENTINEL = object()
+
+    async def producer():
+        try:
+            options = ClaudeAgentOptions(
+                system_prompt=AGENTS[agent_key]["system_prompt"],
+                model=MODEL,
+                setting_sources=[],
+                allowed_tools=[],
+            )
+            async for msg in query(prompt=transcript, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            q.put(block.text)
+        finally:
+            q.put(SENTINEL)
+
+    threading.Thread(target=lambda: anyio.run(producer), daemon=True).start()
+
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            return
+        yield item
+
+
 # -------------------------------------------------------------------------
 # Directive parsing (mirrors cli.py)
 # -------------------------------------------------------------------------
@@ -94,6 +135,31 @@ def parse_handoff(text: str) -> tuple[str, str | None]:
 
 def strip_directives(text: str) -> str:
     return _DIRECTIVE_RE.sub("", text).strip()
+
+
+def parse_incident_params(raw: str) -> dict[str, str]:
+    """Parse `/incident severity:critical service:nginx` → {severity, service}.
+
+    Anything after the command word that contains a colon is treated as
+    a key:value pair. Free-text without a colon is collected into a
+    `summary` field. Unknown shape returns an empty dict.
+    """
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        return {}
+    params: dict[str, str] = {}
+    summary_words: list[str] = []
+    for part in parts[1:]:  # skip the command word itself
+        if ":" in part:
+            k, v = part.split(":", 1)
+            if k and v:
+                params[k.lower()] = v
+        else:
+            summary_words.append(part)
+    if summary_words:
+        params["summary"] = " ".join(summary_words)
+    return params
 
 
 # -------------------------------------------------------------------------
@@ -126,6 +192,12 @@ def _init_state():
     st.session_state.setdefault("post_mortem", None)
     # Approval gate state — set when execution pauses for human input
     st.session_state.setdefault("pending_approval", None)
+    # Slash-command intake
+    st.session_state.setdefault("incident_cmd", "/incident")
+    st.session_state.setdefault("incident_params", {})
+    # Timer
+    st.session_state.setdefault("incident_started_at", None)
+    st.session_state.setdefault("incident_resolved_at", None)
 
 
 _init_state()
@@ -134,24 +206,23 @@ _init_state()
 # ---- Sidebar: incident + controls ---------------------------------------
 
 with st.sidebar:
-    st.markdown("### The incident")
-    st.error(INITIAL_ALERT, icon="🚨")
-
     st.markdown("### The war room")
+    st.caption("Three AI agents in `#ops-incidents`")
     for agent in AGENTS.values():
         st.markdown(f"{agent['avatar']} **{agent['name']}**")
 
     st.markdown("---")
+    st.caption("Type `/incident` in the chat to open the war room.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_clicked = st.button(
-            "🚀 Start",
-            disabled=st.session_state.running or st.session_state.resolved,
-            use_container_width=True,
-        )
-    with col2:
-        reset_clicked = st.button("↺ Reset", use_container_width=True)
+    # Live elapsed-time meter — ticks on every Streamlit rerun (i.e. every
+    # agent turn). After resolution it freezes on the final wall-clock time.
+    if st.session_state.incident_started_at is not None:
+        end = st.session_state.incident_resolved_at or time.monotonic()
+        elapsed = end - st.session_state.incident_started_at
+        label = "⏱ Resolved in" if st.session_state.incident_resolved_at else "⏱ Elapsed"
+        st.metric(label, f"{elapsed:.1f}s")
+
+    reset_clicked = st.button("↺ Reset channel", use_container_width=True)
 
     if reset_clicked:
         reset_world()
@@ -163,18 +234,10 @@ with st.sidebar:
         st.session_state.turn = 0
         st.session_state.post_mortem = None
         st.session_state.pending_approval = None
-        st.rerun()
-
-    if start_clicked:
-        reset_world()
-        st.session_state.messages = []
-        st.session_state.transcript = INITIAL_ALERT
-        st.session_state.active = "decider"
-        st.session_state.running = True
-        st.session_state.resolved = False
-        st.session_state.turn = 0
-        st.session_state.post_mortem = None
-        st.session_state.pending_approval = None
+        st.session_state.incident_started_at = None
+        st.session_state.incident_resolved_at = None
+        st.session_state.incident_params = {}
+        st.session_state.incident_cmd = "/incident"
         st.rerun()
 
     # --- Fleet observability ------------------------------------------------
@@ -237,10 +300,88 @@ with st.sidebar:
 
 # ---- Main: render past messages -----------------------------------------
 
-# Show the alert as the first system message
-if st.session_state.transcript or st.session_state.messages:
+
+def render_alert_card(params: dict[str, str] | None = None):
+    """Render the firing alert as a Slack-style prometheus-bot message.
+
+    `params` are extracted from `/incident key:value …` and shown as a
+    small "Triggered with" subsection. Empty params render the default
+    alert only.
+    """
+    params = params or {}
+    severity = params.get("severity", "critical")
+    service = params.get("service", "nginx")
+    instance = params.get("instance", "vm-web-01")
+
+    params_block = ""
+    if params:
+        rows = "".join(
+            f"<span style='display:inline-block; background:#eef0f4; "
+            f"color:#1d1c1d; font-family: ui-monospace, SFMono-Regular, monospace; "
+            f"font-size:12px; padding:2px 8px; border-radius:3px; margin-right:6px;'>"
+            f"{k}: <strong>{v}</strong></span>"
+            for k, v in params.items()
+        )
+        params_block = f"""
+                <div style='margin-top:10px; padding-top:8px; border-top:1px dashed #e1e5eb;'>
+                  <div style='color:#616061; font-size:11px; font-weight:600; margin-bottom:6px;
+                              text-transform:uppercase; letter-spacing:0.5px;'>
+                    Triggered with
+                  </div>
+                  <div>{rows}</div>
+                </div>"""
+
+    title = f"🔥 [FIRING] NginxReloadFailed · {instance} · {severity}"
+    footer = f"1 of 3 {service} instances unhealthy · authored by deploy-agent (AI)"
+
     with st.chat_message("alert", avatar="🚨"):
-        st.code(INITIAL_ALERT, language="text")
+        st.markdown(
+            f"""
+            <div style='
+                background:#ffffff;
+                border:1px solid #e1e5eb;
+                border-left:4px solid #c0392b;
+                border-radius:6px;
+                padding:14px 18px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+                box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+                margin-bottom: 0.5rem;
+            '>
+              <div style='display:flex; align-items:center; gap:8px; margin-bottom:10px;'>
+                <span style='
+                    background:#c0392b; color:white;
+                    width:28px; height:28px; border-radius:4px;
+                    display:inline-flex; align-items:center; justify-content:center;
+                    font-size:14px;
+                '>🚨</span>
+                <strong style='color:#1d1c1d;'>prometheus-bot</strong>
+                <span style='background:#dddee0; color:#616061; font-size:9px; font-weight:700;
+                             padding:1px 4px; border-radius:2px; letter-spacing:0.5px;'>APP</span>
+                <span style='color:#616061; font-size:12px;'>14:03 UTC · #ops-alerts</span>
+              </div>
+              <div style='color:#1d1c1d; line-height:1.5; font-size:14px;'>
+                <div style='font-weight:700; margin-bottom:8px; color:#c0392b;'>
+                  {title}
+                </div>
+                <div style='background:#f4f4f5; border-left:3px solid #c0392b;
+                            padding:10px 14px; font-family: ui-monospace, SFMono-Regular, monospace;
+                            font-size:13px; margin-bottom:10px; color:#1d1c1d;
+                            white-space:pre-wrap;'>{INITIAL_ALERT}</div>
+                <div style='color:#616061; font-size:12px;'>
+                  {footer}
+                </div>{params_block}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# Show the firing alert + the /incident command that opened the war room
+if st.session_state.transcript or st.session_state.messages:
+    with st.chat_message("user"):
+        st.markdown(f"`{st.session_state.incident_cmd}`")
+    render_alert_card(st.session_state.incident_params)
 
 
 for msg in st.session_state.messages:
@@ -369,6 +510,7 @@ if st.session_state.pending_approval is not None:
             if kind == "end":
                 st.session_state.running = False
                 st.session_state.resolved = True
+                st.session_state.incident_resolved_at = time.monotonic()
                 st.session_state.post_mortem = strip_directives(approval["agent_text"])
             elif payload in AGENTS:
                 st.session_state.active = payload
@@ -413,10 +555,15 @@ elif st.session_state.running and not st.session_state.resolved:
 
         with st.chat_message(agent["name"], avatar=agent["avatar"]):
             st.markdown(f"**{agent['name']}**")
-            with st.spinner(f"{agent['name']} is thinking..."):
-                text = call_agent(active, st.session_state.transcript)
+            placeholder = st.empty()
+            text = ""
+            for chunk in stream_agent_text(active, st.session_state.transcript):
+                text += chunk
+                # Strip directives on every render so >>TOOL / >>NEXT
+                # never flash on screen, even mid-stream.
+                placeholder.markdown(strip_directives(text) + " ▌")
             body = strip_directives(text)
-            st.markdown(body)
+            placeholder.markdown(body)
 
         st.session_state.messages.append(
             {"kind": "agent", "role": active, "body": body}
@@ -452,6 +599,7 @@ elif st.session_state.running and not st.session_state.resolved:
             if kind == "end":
                 st.session_state.running = False
                 st.session_state.resolved = True
+                st.session_state.incident_resolved_at = time.monotonic()
                 st.session_state.post_mortem = body
             elif payload in AGENTS:
                 st.session_state.active = payload
@@ -489,3 +637,31 @@ if st.session_state.resolved and st.session_state.post_mortem:
         file_name="post-mortem.md",
         mime="text/markdown",
     )
+
+
+# ---- Slash-command intake (Slack-style) ---------------------------------
+# A persistent chat input at the bottom mimics the Slack #ops-incidents
+# message box. `/incident` opens the war room; anything else is a no-op
+# with a small hint.
+user_input = st.chat_input(
+    "Type /incident — try /incident severity:critical service:nginx instance:vm-web-01"
+)
+if user_input is not None:
+    typed = user_input.strip()
+    if typed.lower().startswith("/incident"):
+        reset_world()
+        st.session_state.messages = []
+        st.session_state.transcript = INITIAL_ALERT
+        st.session_state.active = "decider"
+        st.session_state.running = True
+        st.session_state.resolved = False
+        st.session_state.turn = 0
+        st.session_state.post_mortem = None
+        st.session_state.pending_approval = None
+        st.session_state.incident_cmd = typed
+        st.session_state.incident_params = parse_incident_params(typed)
+        st.session_state.incident_started_at = time.monotonic()
+        st.session_state.incident_resolved_at = None
+        st.rerun()
+    else:
+        st.toast(f"Unknown command: `{user_input}` — try `/incident`.", icon="💬")
