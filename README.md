@@ -29,9 +29,8 @@ cd agent-warroom
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# Add your Anthropic API key
-cp .env.example .env
-# Edit .env and paste your key (sk-ant-...)
+# Auth happens through your existing Claude Code session — no API key needed.
+# Just make sure `claude` is installed and you've run it at least once.
 
 # Run the war room in your terminal
 .venv/bin/python cli.py
@@ -60,7 +59,7 @@ The war room agents:
 
 ## Tech stack
 
-- **Anthropic Claude API** — for agent reasoning and persona voicing
+- **Claude Agent SDK** — for agent reasoning and persona voicing (uses your Claude Code auth, no API key)
 - **Streamlit** — `st.chat_message` per agent, color-coded
 - **Python** — orchestration via a small handoff loop (~80 lines, no framework)
 - **Mocked Multipass** — fake `multipass exec` tool outputs for demo reliability
@@ -73,7 +72,58 @@ Teams at this hackathon are already running AI coding agents inside Multipass VM
 
 If your AI agent is running in Multipass right now, this is your next outage.
 
-## Design
+## Design principles
+
+### 1. Human approval gates fire on *irreversibility*, not on every write
+
+A human who rubber-stamps every approval prompt is a bottleneck, not a safety net. The principled gate fires when (a) an action is irreversible (truncating data, dropping tables, severing network reachability), or (b) the agents *disagree*. In this demo, `config-revert` and `systemctl reload` are reversible — we still gate them to keep the audit trail and mirror how on-call should hear about production changes, but the deeper version of this system would not interrupt the war room for reversible actions.
+
+What the human is actually providing: **accountability, context the agents lack, and a kill switch**. Not correctness review.
+
+### 2. Lead indicators belong in the war room
+
+The sidebar shows fleet status — how many VMs are healthy, how many AI-authored commits haven't been validated across the fleet, and when the fleet last passed a config syntax check. A human watching this would have caught the bad push at `13:49 UTC`, 14 minutes before the alert fired. Building these dashboards *around* AI behaviour is the unglamorous half of AI-in-production; the glamorous half is the agents, but the unglamorous half is what prevents the next incident.
+
+### 3. Today: AI cleans up after AI. Tomorrow: AI prevents AI.
+
+The war room currently writes a post-mortem with action items: *"add an `nginx -t` pre-deploy gate", "audit deploy-agent's directive generation", "require human review for AI infra commits."* Those items sit in the post-mortem and rot.
+
+The obvious next loop: the Decider doesn't just *write* action items — it **files the tickets and opens the PR**. A future `>>TOOL: file-ticket` and `>>TOOL: open-pr` would close the response loop into a prevention loop. Same demo, bigger arc.
+
+## Integration points
+
+The war room has three swappable boundaries. The demo mocks all three; a production install replaces each with real infrastructure. Every boundary is named inline in the code — grep for `INTEGRATION POINT` to find them. **A reader should not have to ask where their existing tools plug in.**
+
+### 1. Incident intake — *where does the alert come from?*
+- Code: `app.py` near `INITIAL_ALERT`
+- Today: hardcoded string for demo reliability
+- Swap in:
+  - Prometheus Alertmanager webhook
+  - Sensu / Nagios alert handler
+  - Canonical Pro support: new-ticket webhook with attached sosreport
+  - PagerDuty / Opsgenie pager event
+
+### 2. Tool execution — *what actually runs the commands?*
+- Code: `war_room/tools.py` near `run_tool()`
+- Today: every `multipass exec …` returns a canned mock output
+- Swap in:
+  - Real `multipass exec …` via `subprocess`
+  - Juju: `juju run --unit … …`
+  - Ansible ad-hoc: `ansible_runner.run(host=…, module="shell", args=…)`
+  - SSH with audit log via `paramiko` / `fabric`
+
+### 3. Human approval gate — *where does on-call get pinged?*
+- Code: `app.py` near the Slack-style approval card
+- Today: inline Streamlit buttons (Approve / Different action / Hold)
+- Swap in:
+  - Slack interactive message + interactivity webhook
+  - PagerDuty custom action on the incident
+  - Internal operator portal with a queue
+  - Email with a one-click signed approval link
+
+The agent loop, the `>>TOOL:` / `>>NEXT:` protocol, and the `is_mutating()` gate contract stay identical regardless of which integrations you choose.
+
+## Design doc
 
 Full design doc: [`concepts/ubuntu-main-design-20260513-112551.md`](concepts/ubuntu-main-design-20260513-112551.md)
 
