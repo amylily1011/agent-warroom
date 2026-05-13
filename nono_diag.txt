@@ -1,0 +1,5 @@
+DENIED
+  Reason: insufficient_access
+  Details: Path is covered by '/tmp', which grants write access from group:system_write_linux but read was requested
+  Closest match: /tmp (write, group:system_write_linux)
+  Suggested fix: --read /tmp

@@ -2,3 +2,7 @@
 .workshop.lock
 node_modules
 .pnpm-store
+.venv
+__pycache__
+*.pyc
+.env
