@@ -6,10 +6,8 @@ Run with:
 Auth: uses Claude Code session, no API key needed.
 """
 
-import queue
 import re
 import shlex
-import threading
 import time
 
 import anyio
@@ -62,7 +60,7 @@ async def call_agent_async(agent_key: str, transcript: str) -> str:
     options = ClaudeAgentOptions(
         system_prompt=agent["system_prompt"],
         model=MODEL,
-        setting_sources=[],
+        setting_sources=None,  # None → defaults to ["user", "project"] for auth
         allowed_tools=[],
     )
     full_text = ""
@@ -76,43 +74,6 @@ async def call_agent_async(agent_key: str, transcript: str) -> str:
 
 def call_agent(agent_key: str, transcript: str) -> str:
     return anyio.run(call_agent_async, agent_key, transcript)
-
-
-def stream_agent_text(agent_key: str, transcript: str):
-    """Sync generator: yields text chunks as the SDK produces them.
-
-    Bridges the async `query()` iterator into a sync generator via a
-    background thread + queue, so Streamlit (which is sync) can consume
-    tokens as they arrive. If the SDK yields one big chunk per turn,
-    you'll get one yield at the end — the architecture still works,
-    just doesn't *feel* streamed for that case.
-    """
-    q: queue.Queue = queue.Queue()
-    SENTINEL = object()
-
-    async def producer():
-        try:
-            options = ClaudeAgentOptions(
-                system_prompt=AGENTS[agent_key]["system_prompt"],
-                model=MODEL,
-                setting_sources=[],
-                allowed_tools=[],
-            )
-            async for msg in query(prompt=transcript, options=options):
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            q.put(block.text)
-        finally:
-            q.put(SENTINEL)
-
-    threading.Thread(target=lambda: anyio.run(producer), daemon=True).start()
-
-    while True:
-        item = q.get()
-        if item is SENTINEL:
-            return
-        yield item
 
 
 # -------------------------------------------------------------------------
@@ -555,15 +516,10 @@ elif st.session_state.running and not st.session_state.resolved:
 
         with st.chat_message(agent["name"], avatar=agent["avatar"]):
             st.markdown(f"**{agent['name']}**")
-            placeholder = st.empty()
-            text = ""
-            for chunk in stream_agent_text(active, st.session_state.transcript):
-                text += chunk
-                # Strip directives on every render so >>TOOL / >>NEXT
-                # never flash on screen, even mid-stream.
-                placeholder.markdown(strip_directives(text) + " ▌")
+            with st.spinner(f"{agent['name']} is thinking…"):
+                text = call_agent(active, st.session_state.transcript)
             body = strip_directives(text)
-            placeholder.markdown(body)
+            st.markdown(body)
 
         st.session_state.messages.append(
             {"kind": "agent", "role": active, "body": body}
